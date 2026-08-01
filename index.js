@@ -146,12 +146,6 @@ app.post('/joinSessionSecure', verifyToken, verifyAppCheck, async (req, res) => 
         if (!sessionSnap.exists) return res.status(404).json({ error: "⛔ الجلسة غير موجودة." });
         if (!studentSnap.exists) return res.status(404).json({ error: "بيانات الطالب غير موجودة." });
 
-        const sessionUniversityCheck = sessionData.university || "RYADA";
-        const studentUniversity = info.university || "RYADA";
-        if (studentUniversity !== sessionUniversityCheck) {
-            return res.status(403).json({ error: "⛔ هذه الجلسة ليست لجامعتك." });
-        }
-
         const isEmailVerified = req.user.email_verified;
         const isManuallyVerified = (sData.status === 'verified' || sData.manual_verification === true);
 
@@ -548,11 +542,12 @@ app.post('/api/registerFaculty', verifyAppCheck, async (req, res) => {
         if (!keysDoc.exists) return res.status(500).json({ error: "المفاتيح غير مهيأة في السيرفر" });
 
         const serverKeys = keysDoc.data();
-        const uniKeys = serverKeys[finalUniversity];
 
-        if (!uniKeys) {
-            return res.status(500).json({ error: "🚫 لا توجد مفاتيح مسجلة لهذه الجامعة" });
-        }
+        // ✅ [تعديل جراحي] لو الجامعة عندها مفاتيح خاصة (map) استخدمها، وإلا ارجع للمفاتيح القديمة المسطحة (توافق مع النظام القديم)
+        const uniKeys = serverKeys[finalUniversity] || {
+            dean_key: serverKeys.dean_key,
+            doctor_key: serverKeys.doctor_key
+        };
 
         // 2. التحقق من المفتاح الخاص بهذه الجامعة تحديدًا
         let isValid = false;
