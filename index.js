@@ -146,9 +146,11 @@ app.post('/joinSessionSecure', verifyToken, verifyAppCheck, async (req, res) => 
         if (!sessionSnap.exists) return res.status(404).json({ error: "⛔ الجلسة غير موجودة." });
         if (!studentSnap.exists) return res.status(404).json({ error: "بيانات الطالب غير موجودة." });
 
-        const sessionData = sessionSnap.data();
-        const sData = studentSnap.data();
-        const info = sData.registrationInfo || {};
+        const sessionUniversityCheck = sessionData.university || "RYADA";
+        const studentUniversity = info.university || "RYADA";
+        if (studentUniversity !== sessionUniversityCheck) {
+            return res.status(403).json({ error: "⛔ هذه الجلسة ليست لجامعتك." });
+        }
 
         const isEmailVerified = req.user.email_verified;
         const isManuallyVerified = (sData.status === 'verified' || sData.manual_verification === true);
@@ -289,10 +291,8 @@ app.post('/api/closeSession', verifyToken, verifyStaffRole, verifyAppCheck, asyn
             return res.status(400).json({ error: "الجلسة مغلقة بالفعل" });
         }
 
-        // ✅ [تعديل جراحي] جلب كلية الدكتور من بيانات الجلسة أو من faculty_members
-        const sessionCollege = settings.college ||
-            (req.staffData && req.staffData.college) ||
-            "NURS";
+        const sessionCollege = settings.college || (req.staffData && req.staffData.college) || "NURS";
+        const sessionUniversity = settings.university || (req.staffData && req.staffData.university) || "RYADA"; // ✅ إضافة الجامعة
         const sessionSisCode = settings.sisCode || "";
 
         // جيب المشاركين
@@ -336,7 +336,7 @@ app.post('/api/closeSession', verifyToken, verifyStaffRole, verifyAppCheck, asyn
 
             if (p.status === "active" || p.status === "on_break") {
                 // ✅ [تعديل جراحي] الـ ID يتضمن الكلية لضمان التفرد بين الكليات
-                const recID = `${p.id}_${fixedDateStr.replace(/\//g, '-')}_${cleanSubKey}_${sessionCollege}`;
+                const recID = `${p.id}_${fixedDateStr.replace(/\//g, '-')}_${cleanSubKey}_${sessionUniversity}_${sessionCollege}`;
                 const attRef = db.collection('attendance').doc(recID);
 
                 let finalGroup = (p.group && p.group !== "General") ? p.group : targetGroups[0];
@@ -351,6 +351,7 @@ app.post('/api/closeSession', verifyToken, verifyStaffRole, verifyAppCheck, asyn
                     hall: settings.hall,
                     group: finalGroup,
                     college: sessionCollege,          // ✅ جديد
+                    university: sessionUniversity,
                     date: fixedDateStr,
                     time_str: p.time_str || req.body.time_str || closeTimeStr,
                     segment_count: p.segment_count || 1,
@@ -372,7 +373,8 @@ app.post('/api/closeSession', verifyToken, verifyStaffRole, verifyAppCheck, asyn
                 let statsUpdate = {
                     group: finalGroup,
                     studentID: p.id,
-                    college: sessionCollege,          // ✅ جديد
+                    college: sessionCollege,
+                    university: sessionUniversity,
                     last_updated: admin.firestore.FieldValue.serverTimestamp(),
                     attended: {
                         [cleanSubKey]: admin.firestore.FieldValue.increment(1)
@@ -403,16 +405,15 @@ app.post('/api/closeSession', verifyToken, verifyStaffRole, verifyAppCheck, asyn
             if (opCounter >= BATCH_LIMIT) pushBatch();
         });
 
-        // ج. تسجيل عداد المحاضرة (+ college للتفرد)
         const safeDateID = fixedDateStr.replace(/\//g, '-');
         targetGroups.forEach(grp => {
-            // ✅ [تعديل جراحي] الـ ID يتضمن الكلية
-            const uniqueCounterID = `${safeDateID}_${cleanSubKey}_${grp}_${sessionCollege}`;
+            const uniqueCounterID = `${safeDateID}_${cleanSubKey}_${grp}_${sessionUniversity}_${sessionCollege}`;
             const counterRef = db.collection('course_counters').doc(uniqueCounterID);
             currentBatch.set(counterRef, {
                 subject: rawSubject,
                 targetGroups: [grp],
-                college: sessionCollege,              // ✅ جديد
+                college: sessionCollege,
+                university: sessionUniversity,
                 date: fixedDateStr,
                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
                 doctorUID: doctorUID,
@@ -446,6 +447,7 @@ app.post('/api/closeSession', verifyToken, verifyStaffRole, verifyAppCheck, asyn
                         student_name: p.name,
                         subject_name: rawSubject,
                         college: sessionCollege,
+                        university: sessionUniversity,
                         hall: settings.hall || "",
                         target_group: finalGroup,
                         sis_code: sessionSisCode || "",
@@ -529,24 +531,39 @@ app.post('/api/closeSession', verifyToken, verifyStaffRole, verifyAppCheck, asyn
 app.post('/api/registerFaculty', verifyAppCheck, async (req, res) => {
 
     try {
-        const { email, password, fullName, gender, role, jobTitle, masterKey, college } = req.body;
+        const { email, password, fullName, gender, role, jobTitle, masterKey, college, university } = req.body;
 
-        // 1. جلب المفاتيح السرية
+        // ✅ [تعديل جراحي] التحقق من وجود الجامعة أولاً
+        const VALID_UNIVERSITIES = ["RYADA", "RST", "MUST"];
+        const finalUniversity = (university && VALID_UNIVERSITIES.includes(university.toUpperCase()))
+            ? university.toUpperCase()
+            : null;
+
+        if (!finalUniversity) {
+            return res.status(400).json({ error: "⚠️ يرجى اختيار الجامعة الصحيحة" });
+        }
+
+        // 1. جلب المفاتيح السرية (لكل جامعة على حدة)
         const keysDoc = await db.collection("system_keys").doc("registration_keys").get();
         if (!keysDoc.exists) return res.status(500).json({ error: "المفاتيح غير مهيأة في السيرفر" });
 
         const serverKeys = keysDoc.data();
+        const uniKeys = serverKeys[finalUniversity];
 
-        // 2. التحقق من المفتاح
-        let isValid = false;
-        if (role === 'dean' && masterKey === serverKeys.dean_key) isValid = true;
-        if (role === 'doctor' && masterKey === serverKeys.doctor_key) isValid = true;
-
-        if (!isValid) {
-            return res.status(403).json({ error: "🚫 المفتاح السري (Master Key) غير صحيح!" });
+        if (!uniKeys) {
+            return res.status(500).json({ error: "🚫 لا توجد مفاتيح مسجلة لهذه الجامعة" });
         }
 
-        // ✅ [تعديل جراحي] التحقق من وجود الكلية
+        // 2. التحقق من المفتاح الخاص بهذه الجامعة تحديدًا
+        let isValid = false;
+        if (role === 'dean' && masterKey === uniKeys.dean_key) isValid = true;
+        if (role === 'doctor' && masterKey === uniKeys.doctor_key) isValid = true;
+
+        if (!isValid) {
+            return res.status(403).json({ error: "🚫 المفتاح السري (Master Key) غير صحيح لهذه الجامعة!" });
+        }
+
+        // ✅ التحقق من وجود الكلية
         const VALID_COLLEGES = ["NURS", "ENG", "ART", "MED", "VET", "MEDIA", "ALSUN", "PT", "DENT", "CS", "PHARM", "HS", "BA"];
         const finalCollege = (college && VALID_COLLEGES.includes(college.toUpperCase()))
             ? college.toUpperCase()
@@ -564,19 +581,20 @@ app.post('/api/registerFaculty', verifyAppCheck, async (req, res) => {
             adminRole: role
         });
 
-        // 5. حفظ البيانات في Firestore (+ college)
+        // 5. حفظ البيانات في Firestore (+ college + university)
         await db.collection("faculty_members").doc(userRecord.uid).set({
             fullName,
             gender,
             role,
             jobTitle,
             email,
-            college: finalCollege,                    // ✅ جديد
+            college: finalCollege,
+            university: finalUniversity,               // ✅ جديد
             isVerified: "waiting",
             registeredAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        console.log(`✅ Faculty Registered: ${fullName} | College: ${finalCollege}`);
+        console.log(`✅ Faculty Registered: ${fullName} | University: ${finalUniversity} | College: ${finalCollege}`);
         res.status(200).json({ success: true, message: "تم تسجيل الحساب بنجاح" });
 
     } catch (error) {
@@ -775,7 +793,9 @@ app.post('/api/sync-supabase', verifyToken, verifyStaffRole, async (req, res) =>
         (attended || []).forEach(p => {
             records.push({
                 student_id: p.id, student_name: p.name, subject_name: meta.rawSubject,
-                college: meta.college || "NURS", hall: meta.hall || "",
+                college: meta.college || "NURS",
+                university: meta.university || "RYADA",
+                hall: meta.hall || "",
                 target_group: p.group || (meta.targetGroups && meta.targetGroups[0]) || "General",
                 sis_code: meta.sisCode || "", session_date: meta.fixedDateStr,
                 attendance_time: p.time_str || meta.closeTimeStr,
@@ -801,7 +821,9 @@ app.post('/api/sync-supabase', verifyToken, verifyStaffRole, async (req, res) =>
         (absent || []).forEach(s => {
             records.push({
                 student_id: s.id, student_name: s.name, subject_name: meta.rawSubject,
-                college: meta.college || "NURS", hall: meta.hall || "", target_group: s.group || (meta.targetGroups && meta.targetGroups[0]) || "General",
+                college: meta.college || "NURS",
+                university: meta.university || "RYADA",
+                hall: meta.hall || "", target_group: s.group || (meta.targetGroups && meta.targetGroups[0]) || "General",
                 sis_code: meta.sisCode || "", session_date: meta.fixedDateStr, attendance_time: "--:--",
                 status: "ABSENT", is_unruly: false, is_uniform_violation: false, notes: "غائب",
                 doctor_uid: doctorUID, doctor_name: meta.doctorName, is_recovered: false
